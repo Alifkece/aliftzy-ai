@@ -19,6 +19,18 @@ Browser → Aliftzy Codes AI UI → /api/chat (server) → Gemini Interactions A
 - Animated AI Core orb (idle breathing, active pulse while generating), original SVG logo
 - Dark (default) / Light / System theme, responsive layout with a mobile drawer, keyboard and screen-reader support
 
+## Files, long answers, preview and ZIP
+
+When you ask for a website, script or project, the model writes **real files** through a small structured protocol (`lib/chat/file-protocol.ts`) instead of Markdown code fences. Each file is a card in the chat (name, language, status); click it to open the file panel with syntax-highlighted code, **Preview**, **Copy** and **Download**.
+
+- **No Continue button.** `lib/chat/orchestrator.ts` checks after every provider round whether the work is really finished (provider stop status *and* structure: no file left open, every planned file written). Cut-off answers are continued automatically and precisely (the open file is named, overlap is removed), bounded by a round limit, a stall guard and a time budget. If it still fails, the draft is kept, an honest error is shown, and unfinished files are never downloadable or zipped as final. **Retry** restarts the job.
+- **A file is complete only when its own end marker (with a per-request random token) arrived.** Code fences or marker look-alikes inside a file are plain content.
+- **ZIP** is built in the browser, read back and CRC-checked before the button is enabled. Secrets (`.env*`, keys), `node_modules`, `.next`, `.git` and similar are excluded and listed.
+- **Edits:** files you attach and files generated earlier are the baseline. Generated files are classified new / modified / unchanged by content; “changed only” ZIPs contain only new and really modified files; deletions are listed, never applied silently.
+- **Preview** runs in a sandboxed iframe (`allow-scripts allow-forms allow-modals`, no same-origin access). Local CSS/JS/SVG are inlined with paths resolved relative to the HTML file. No backend, build step or browser storage inside the preview.
+
+Tests: `npm test` (Node 22.18+ runs the TypeScript tests directly; no extra dependency).
+
 ## Tech Stack
 
 Next.js 15 (App Router), React 19, TypeScript, Tailwind CSS, `@google/genai`, `react-markdown` + `remark-gfm` + `rehype-highlight`. No animation library: everything is CSS (`transform` / `opacity`). Node.js 22 or later (required by `@google/genai` 3.x).
