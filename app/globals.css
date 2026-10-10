@@ -308,3 +308,23 @@ body {
     transition-duration: 0.01ms !important;
   }
 }
+
+/* Generated file view (FilePanel / HighlightedCode): scrolls both ways, never wraps source lines */
+pre.file-code {
+  margin: 0;
+  padding: 14px 16px;
+  overflow: auto;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1.65;
+  white-space: pre;
+  tab-size: 2;
+  background: transparent;
+  color: rgb(var(--fg));
+}
+pre.file-code code {
+  font-family: inherit;
+  background: none !important;
+  border: 0 !important;
+  padding: 0 !important;
+}
