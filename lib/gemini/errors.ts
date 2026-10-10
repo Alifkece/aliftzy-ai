@@ -60,3 +60,10 @@ export function toSafeError(err: unknown): SafeError {
   }
   return { status: 500, message: GENERIC };
 }
+
+/** True for failures where trying the same request again can succeed (rate limit, 5xx, network). */
+export function isTransientError(err: unknown): boolean {
+  const status = statusOf(err);
+  if (status !== null) return status === 429 || status === 408 || (status >= 500 && status <= 504);
+  return err instanceof Error && /fetch failed|ENOTFOUND|ECONNRESET|ETIMEDOUT|network|socket|terminated/i.test(err.message);
+}

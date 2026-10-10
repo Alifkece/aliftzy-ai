@@ -17,8 +17,8 @@ import { makeTitle } from "./title";
 import { uid } from "@/lib/utils/id";
 
 const MAX_HISTORY = 40;
-const CONTINUE_PROMPT =
-  "Your previous answer was cut off. Continue exactly where it stopped, without repeating anything. If you were inside a code block, keep going inside it with the same file.";
+/** Budget for text attachments of OLDER messages that are re-sent so edits keep the user's file as source of truth. */
+const OLD_TEXT_ATTACHMENT_BUDGET = 1_500_000;
 
 function toStored(a: Attachment): StoredAttachment {
   return { id: a.id, name: a.name, kind: a.kind, mime: a.mime, size: a.size };
@@ -42,6 +42,8 @@ export function useChat() {
   const streamingRef = useRef(false);
   const pendingRef = useRef<Attachment[]>([]);
   const abortRef = useRef<AbortController | null>(null);
+  /** Identifies the running generation; a finished/aborted older one must never touch newer state. */
+  const genRef = useRef(0);
   /** Binary attachments live in memory only (never localStorage): user message id -> attachments. */
   const liveStore = useRef(new Map<string, Attachment[]>());
 
@@ -114,7 +116,16 @@ export function useChat() {
     abortRef.current?.abort();
   }, []);
 
-  const buildRequest = useCallback((all: Message[], continuing: boolean): ChatMessagePayload[] => {
+  /** Aborts the running generation and frees the UI immediately (new chat, switching, deleting). */
+  const abortActive = useCallback(() => {
+    abortRef.current?.abort();
+    abortRef.current = null;
+    genRef.current += 1;
+    streamingRef.current = false;
+    setStreamingId(null);
+  }, []);
+
+  const buildRequest = useCallback((all: Message[]): ChatMessagePayload[] => {
     // Only the latest turns are sent: keeps requests small and responses fast.
     let history = all.slice(-MAX_HISTORY);
     while (history.length > 0 && history[0].role !== "user") history = history.slice(1);
@@ -122,33 +133,37 @@ export function useChat() {
     history.forEach((m, i) => {
       if (m.role === "user") lastUser = i;
     });
+    let oldTextBudget = OLD_TEXT_ATTACHMENT_BUDGET;
     const payload = history.map((m, i): ChatMessagePayload => {
       if (m.role === "assistant") return { role: "assistant", content: m.content };
-      // Binary only for the newest user message; older attachments are referenced by name.
-      const live = i === lastUser ? liveStore.current.get(m.id) : undefined;
       const stored = m.attachments ?? [];
-      const unavailable = stored.filter((s) => !live?.some((l) => l.id === s.id));
+      const liveAll = liveStore.current.get(m.id) ?? [];
+      // Newest user message: everything. Older ones: only text files (within a budget), so an edit
+      // request later in the chat still sees the file the user attached earlier.
+      const sendable =
+        i === lastUser
+          ? liveAll
+          : liveAll.filter((a) => {
+              if (a.kind !== "document" || a.text === undefined || a.text.length > oldTextBudget) return false;
+              oldTextBudget -= a.text.length;
+              return true;
+            });
+      const unavailable = stored.filter((s) => !sendable.some((l) => l.id === s.id));
       let content = m.content;
       if (unavailable.length > 0) {
         const note = `[Previously attached: ${unavailable.map((a) => a.name).join(", ")}]`;
         content = content ? `${content}\n\n${note}` : note;
       }
-      return { role: "user", content, attachments: live && live.length > 0 ? live.map(toPayloadAttachment) : undefined };
+      return { role: "user", content, attachments: sendable.length > 0 ? sendable.map(toPayloadAttachment) : undefined };
     });
-    if (continuing) payload.push({ role: "user", content: CONTINUE_PROMPT });
     return payload;
   }, []);
 
   const generate = useCallback(
-    async (convId: string, history: Message[], resumeId?: string) => {
-      const assistant: Message = resumeId
-        ? (history.find((m) => m.id === resumeId) as Message)
-        : { id: uid(), role: "assistant", content: "", createdAt: Date.now() };
-      if (resumeId) {
-        patchMessage(convId, resumeId, (m) => ({ ...m, truncated: false, error: undefined, stopped: false }));
-      } else {
-        update((prev) => prev.map((c) => (c.id === convId ? { ...c, messages: [...c.messages, assistant], updatedAt: Date.now() } : c)));
-      }
+    async (convId: string, history: Message[]) => {
+      const assistant: Message = { id: uid(), role: "assistant", content: "", createdAt: Date.now() };
+      update((prev) => prev.map((c) => (c.id === convId ? { ...c, messages: [...c.messages, assistant], updatedAt: Date.now() } : c)));
+      const gen = ++genRef.current;
       setStreamingId(assistant.id);
       streamingRef.current = true;
 
@@ -156,7 +171,6 @@ export function useChat() {
       abortRef.current = controller;
 
       let buffer = "";
-      let streamed = "";
       let raf = 0;
       const flush = () => {
         raf = 0;
@@ -167,35 +181,41 @@ export function useChat() {
       };
 
       const result = await streamChat(
-        { messages: buildRequest(history, Boolean(resumeId)) },
+        { messages: buildRequest(history) },
         {
           signal: controller.signal,
           onText: (t) => {
             buffer += t;
-            streamed += t;
             if (!raf) raf = requestAnimationFrame(flush);
           },
+          onReplace: (full) => {
+            // Authoritative text: pending chunks are obsolete.
+            if (raf) cancelAnimationFrame(raf);
+            raf = 0;
+            buffer = "";
+            patchMessage(convId, assistant.id, (m) => ({ ...m, content: full }));
+          },
+          onProgress: (message) => patchMessage(convId, assistant.id, (m) => ({ ...m, progress: message })),
         },
       );
 
       if (raf) cancelAnimationFrame(raf);
       flush();
 
+      // Everything received stays in `content` whatever happened: it is a draft, never silently discarded.
       if (controller.signal.aborted) {
-        patchMessage(convId, assistant.id, (m) => ({ ...m, stopped: true }));
+        patchMessage(convId, assistant.id, (m) => ({ ...m, stopped: true, progress: undefined }));
       } else if (!result.ok) {
-        patchMessage(convId, assistant.id, (m) => ({ ...m, error: result.message }));
-      } else if (
-        /interrupted|incomplete|max|length|truncat/i.test(result.stopReason ?? "") ||
-        // A code block that never closed means the answer was cut off, whatever the reported status.
-        ((assistant.content + streamed).match(/^```/gm)?.length ?? 0) % 2 === 1
-      ) {
-        patchMessage(convId, assistant.id, (m) => ({ ...m, truncated: true }));
+        patchMessage(convId, assistant.id, (m) => ({ ...m, error: result.message, progress: undefined }));
+      } else {
+        patchMessage(convId, assistant.id, (m) => ({ ...m, progress: undefined }));
       }
 
-      abortRef.current = null;
-      streamingRef.current = false;
-      setStreamingId(null);
+      if (genRef.current === gen) {
+        abortRef.current = null;
+        streamingRef.current = false;
+        setStreamingId(null);
+      }
       update((prev) => prev.map((c) => (c.id === convId ? { ...c, updatedAt: Date.now() } : c)));
     },
     [buildRequest, patchMessage, update],
@@ -256,32 +276,24 @@ export function useChat() {
     void generate(conv.id, history);
   }, [generate, update]);
 
-  const continueGeneration = useCallback(() => {
-    if (streamingRef.current) return;
-    const conv = convRef.current.find((c) => c.id === activeRef.current);
-    const last = conv?.messages[conv.messages.length - 1];
-    if (!conv || !last || last.role !== "assistant" || !last.content) return;
-    void generate(conv.id, conv.messages, last.id);
-  }, [generate]);
-
   const newChat = useCallback(() => {
-    abortRef.current?.abort();
+    abortActive();
     setActiveId(null);
     activeRef.current = null;
     setDraft("");
     clearPending(true);
-  }, [clearPending]);
+  }, [abortActive, clearPending]);
 
   const selectConversation = useCallback(
     (id: string) => {
       if (id === activeRef.current) return;
-      abortRef.current?.abort();
+      abortActive();
       setActiveId(id);
       activeRef.current = id;
       setDraft("");
       clearPending(true);
     },
-    [clearPending],
+    [abortActive, clearPending],
   );
 
   const renameConversation = useCallback(
@@ -295,7 +307,7 @@ export function useChat() {
 
   const deleteConversation = useCallback(
     (id: string) => {
-      if (activeRef.current === id) abortRef.current?.abort();
+      if (activeRef.current === id) abortActive();
       const target = convRef.current.find((c) => c.id === id);
       if (target) releaseMessages(target.messages);
       update((prev) => prev.filter((c) => c.id !== id));
@@ -304,11 +316,11 @@ export function useChat() {
         activeRef.current = null;
       }
     },
-    [releaseMessages, update],
+    [abortActive, releaseMessages, update],
   );
 
   const clearAll = useCallback(() => {
-    abortRef.current?.abort();
+    abortActive();
     convRef.current.forEach((c) => releaseMessages(c.messages));
     clearConversations();
     update(() => []);
@@ -316,7 +328,7 @@ export function useChat() {
     activeRef.current = null;
     setDraft("");
     clearPending(true);
-  }, [clearPending, releaseMessages, update]);
+  }, [abortActive, clearPending, releaseMessages, update]);
 
   const addFiles = useCallback(async (files: File[]) => {
     const room = LIMITS.maxAttachmentsPerMessage - pendingRef.current.length;
@@ -381,7 +393,6 @@ export function useChat() {
     send,
     stop,
     regenerate,
-    continueGeneration,
     newChat,
     selectConversation,
     renameConversation,

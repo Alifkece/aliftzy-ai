@@ -1,4 +1,4 @@
-import type { AppSettings, Conversation } from "@/types";
+import type { AppSettings, Conversation, Message } from "@/types";
 
 /**
  * Persistence boundary. Swap this module for a database-backed implementation later;
@@ -15,7 +15,7 @@ export function loadConversations(): Conversation[] {
     if (!raw) return [];
     const parsed: unknown = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
-    return parsed.filter(isConversation).sort((a, b) => b.updatedAt - a.updatedAt);
+    return parsed.filter(isConversation).map(migrate).sort((a, b) => b.updatedAt - a.updatedAt);
   } catch {
     return [];
   }
@@ -55,6 +55,18 @@ export function saveSettings(settings: AppSettings): void {
   } catch {
     /* ignore */
   }
+}
+
+/** Older versions flagged cut-off answers with `truncated` and offered a Continue button; that flow no longer exists. */
+function migrate(c: Conversation): Conversation {
+  return {
+    ...c,
+    messages: c.messages.map((m) => {
+      const { truncated, ...rest } = m as Message & { truncated?: boolean };
+      if (!truncated) return rest;
+      return { ...rest, error: rest.error ?? "This answer was cut off (saved by an older version). Use Retry to generate it again." };
+    }),
+  };
 }
 
 function isConversation(v: unknown): v is Conversation {

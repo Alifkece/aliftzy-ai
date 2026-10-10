@@ -28,6 +28,8 @@ export const LIMITS = {
   maxPayloadChars: 4.2 * 1024 * 1024,
   maxMessages: 100,
   maxTextChars: 200_000,
+  /** Assistant turns replay generated projects (possibly several rounds long) in follow-up requests. */
+  maxAssistantChars: 800_000,
 } as const;
 
 export const ERRORS = {

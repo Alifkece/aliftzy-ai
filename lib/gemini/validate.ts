@@ -76,7 +76,7 @@ function validateMessage(raw: unknown): ChatMessagePayload {
   const { role, content } = raw;
   if (role !== "user" && role !== "assistant") throw new ValidationError("Invalid message role.");
   if (typeof content !== "string") throw new ValidationError("Invalid message content.");
-  if (content.length > LIMITS.maxTextChars) throw new ValidationError("Message is too long.");
+  if (content.length > (role === "assistant" ? LIMITS.maxAssistantChars : LIMITS.maxTextChars)) throw new ValidationError("Message is too long.");
 
   let attachments: ChatAttachmentPayload[] | undefined;
   if (raw.attachments !== undefined) {
