@@ -1,6 +1,9 @@
 import { getClient } from "@/lib/gemini/client";
 import { getMaxOutputTokens, getModel, getThinkingLevel, hasApiKey } from "@/lib/gemini/config";
-import { MISSING_KEY_MESSAGE, toSafeError } from "@/lib/gemini/errors";
+import { MISSING_KEY_MESSAGE, isTransientError, toSafeError } from "@/lib/gemini/errors";
+import { detectIntent, type Intent } from "@/lib/chat/intent";
+import { marker, newToken, renormalizeMarkers } from "@/lib/chat/file-protocol";
+import { orchestrate, type RunRound } from "@/lib/chat/orchestrator";
 import { buildSteps } from "@/lib/gemini/build-input";
 import { ValidationError, validateChatRequest } from "@/lib/gemini/validate";
 import { LIMITS } from "@/lib/files/rules";
@@ -12,12 +15,35 @@ export const maxDuration = 300;
 // Run close to Indonesian users (Singapore) instead of the default US region: much lower latency.
 export const preferredRegion = "sin1";
 
-const SYSTEM_PROMPT = [
-  "You are the assistant inside the chat app Aliftzy Codes AI. Be helpful, precise and honest. Answer in the user's language. Be concise: no filler, no long introductions.",
-  "Use Markdown. Put all code in fenced code blocks with a language tag.",
-  "When you write files (a website, a script, a project), give each file complete in its own fenced block and label it with its file name, for example ```html title=\"index.html\" or ```css title=\"css/style.css\". Never abbreviate a file with placeholders like '...rest of the code'.",
-  "This app shows a Download button on every code block and a Download ZIP button under answers that contain several files. If the user asks for a file or a zip, provide the files in labeled blocks and tell them to use those buttons. Never say that you cannot create or send files.",
-].join("\n");
+/**
+ * Files are written between marker lines carrying a per-request token (see lib/chat/file-protocol.ts), not in
+ * Markdown fences: the app can then tell exactly which file is open, finished or missing, continue a cut-off
+ * file automatically, and build real downloads and ZIPs from structured data.
+ */
+function buildSystemPrompt(token: string, intent: Intent): string {
+  const lines = [
+    "You are the assistant inside the chat app Aliftzy Codes AI. Be helpful, precise and honest. Answer in the user's language. Be concise: no filler, no long introductions.",
+    "For normal questions and conversation, answer in Markdown. Short snippets and examples go in fenced code blocks with a language tag. Do NOT create files unless the user asks for a file, website, app, script, project, or an edit of their files.",
+    "",
+    "FILE OUTPUT PROTOCOL (use it whenever you write or edit files):",
+    `Start with one line listing every file you will write: ${marker.plan(token, ["index.html", "css/style.css"])}`,
+    "Then write each file like this. Marker lines stand alone on their own line, starting in column 1:",
+    marker.file(token, "<language>", "<relative/path/file.ext>"),
+    "<the complete raw content of the file>",
+    marker.end(token),
+    "Rules:",
+    "- Use exactly the token above in every marker. Never put marker lines, Markdown fences or explanations inside a file. Normal code comments are fine.",
+    "- Every file must be complete and runnable. Never abbreviate with placeholders such as '...rest of the code'.",
+    "- Use relative paths with real folders (css/style.css, js/app.js, components/navbar.html) and the exact file names the user asked for. For a website, write separate HTML, CSS and JS files unless the user asks for a single file; a single HTML file means one complete file with inline CSS/JS.",
+    "- Do not repeat file contents in your prose. The app shows each file as a card with Preview, Copy and Download, and builds ZIP downloads itself. Before the files write one or two sentences; after the files write a short summary of what you did. Never say you cannot create or send files, and never claim anything was uploaded to GitHub.",
+    "- Editing: files the user attached and files you wrote earlier in this conversation are the source of truth. Keep everything unrelated unchanged. Write a file only if it is new or really changed, always with its complete new content (no diffs, no patches). To delete a file, write " + marker.del(token, "<path>") + " on its own line instead of deleting it silently.",
+    "- Never put API keys, tokens or .env contents in files; use placeholders and a .env.example if configuration is needed.",
+    "- If the job is large, order the files by importance and finish each one completely before starting the next. If you are cut off you will be asked to continue; continue exactly where you stopped.",
+  ];
+  if (intent.zip) lines.push("- The user asked for a ZIP: write every file the project needs with the markers above. The app packages them into a real ZIP; do not explain how to zip.");
+  if (intent.changedOnly) lines.push("- The user wants ONLY the files that changed: write only new or really modified files (complete content) and list deletions with the delete marker. Do not write unchanged files.");
+  return lines.join("\n");
+}
 
 type Upstream = AsyncIterable<unknown> & { controller?: { abort?: () => void } };
 
@@ -47,9 +73,14 @@ export async function POST(req: Request): Promise<Response> {
     return json(400, "Invalid request.");
   }
 
+  const token = newToken();
   let steps;
+  let intent: Intent = { zip: false, changedOnly: false };
   try {
-    steps = buildSteps(validateChatRequest(body).messages);
+    const messages = validateChatRequest(body).messages.map((m) => (m.role === "assistant" ? { ...m, content: renormalizeMarkers(m.content, token) } : m));
+    const lastUser = [...messages].reverse().find((m) => m.role === "user");
+    intent = detectIntent(lastUser?.content ?? "");
+    steps = buildSteps(messages);
   } catch (err) {
     if (err instanceof ValidationError) return json(400, err.message);
     return json(400, "Invalid request.");
@@ -73,67 +104,84 @@ export async function POST(req: Request): Promise<Response> {
         }
       };
 
-      let upstream: Upstream | null = null;
-      req.signal.addEventListener(
-        "abort",
-        () => {
-          // Stop button -> client aborts fetch -> stop reading and, if the SDK exposes it, cancel upstream.
-          try {
-            upstream?.controller?.abort?.();
-          } catch {
-            /* best effort */
-          }
-        },
-        { once: true },
-      );
+      const systemPrompt = buildSystemPrompt(token, intent);
+      const startedAt = Date.now();
 
-      try {
-        // Same call as the reference: ai.interactions.create({ model, input }), plus streaming.
-        // Stateless: the full history is sent as steps and nothing is stored (store: false).
-        // The params object is cast because the SDK's generated types are stricter than the
-        // documented JSON shape we build in lib/gemini/build-input.ts.
+      // One provider round. Same call as before: ai.interactions.create({ model, input }) with streaming and
+      // stateless history (store: false). The params object is cast because the SDK's generated types are
+      // stricter than the documented JSON shape built in lib/gemini/build-input.ts.
+      const runRound: RunRound = async (roundSteps, signal, onText) => {
         const params = {
           model: getModel(),
-          input: steps,
-          system_instruction: SYSTEM_PROMPT,
+          input: roundSteps,
+          system_instruction: systemPrompt,
           generation_config: { max_output_tokens: getMaxOutputTokens(), thinking_level: getThinkingLevel() },
           store: false,
           stream: true,
         };
-        const startedAt = Date.now();
+        let status: string | null = null;
+        let sawCompleted = false;
         let firstTokenMs = 0;
         let chars = 0;
-        let status: string | null = null;
         const seen: Record<string, number> = {};
+        const roundStart = Date.now();
 
-        upstream = (await getClient().interactions.create(params as never)) as unknown as Upstream;
-
-        for await (const raw of upstream) {
-          if (req.signal.aborted) break;
-          const event = raw as RawEvent;
-          const kind = `${event.event_type ?? "?"}${event.delta?.type ? ":" + event.delta.type : ""}`;
-          seen[kind] = (seen[kind] ?? 0) + 1;
-          if (event.event_type === "step.delta" && event.delta?.type === "text" && typeof event.delta.text === "string") {
-            if (!firstTokenMs) firstTokenMs = Date.now() - startedAt;
-            chars += event.delta.text.length;
-            send({ type: "text", text: event.delta.text });
-          } else if (event.event_type === "interaction.status_update" && typeof event.status === "string") {
-            status = event.status;
-          } else if (event.event_type === "interaction.completed") {
-            if (typeof event.interaction?.status === "string") status = event.interaction.status;
-          } else if (event.event_type === "error") {
-            const code = Number(event.error?.code);
-            throw Object.assign(new Error(event.error?.message ?? ""), { status: Number.isFinite(code) ? code : undefined });
+        const upstream = (await getClient().interactions.create(params as never)) as unknown as Upstream;
+        const abortUpstream = () => {
+          try {
+            upstream.controller?.abort?.();
+          } catch {
+            /* best effort */
           }
+        };
+        if (signal.aborted) abortUpstream();
+        signal.addEventListener("abort", abortUpstream, { once: true });
+        try {
+          for await (const raw of upstream) {
+            if (signal.aborted) break;
+            const event = raw as RawEvent;
+            const kind = `${event.event_type ?? "?"}${event.delta?.type ? ":" + event.delta.type : ""}`;
+            seen[kind] = (seen[kind] ?? 0) + 1;
+            if (event.event_type === "step.delta" && event.delta?.type === "text" && typeof event.delta.text === "string") {
+              if (!firstTokenMs) firstTokenMs = Date.now() - roundStart;
+              chars += event.delta.text.length;
+              onText(event.delta.text);
+            } else if (event.event_type === "interaction.status_update" && typeof event.status === "string") {
+              status = event.status;
+            } else if (event.event_type === "interaction.completed") {
+              sawCompleted = true;
+              if (typeof event.interaction?.status === "string") status = event.interaction.status;
+            } else if (event.event_type === "error") {
+              const code = Number(event.error?.code);
+              throw Object.assign(new Error(event.error?.message ?? ""), { status: Number.isFinite(code) ? code : undefined });
+            }
+          }
+        } finally {
+          signal.removeEventListener("abort", abortUpstream);
         }
-        // Timing only (no content): visible in Vercel → Logs to see where the time goes.
-        console.info("[api/chat] finished", { firstTokenMs, totalMs: Date.now() - startedAt, chars, status, events: seen });
-        if (!req.signal.aborted) send({ type: "done", stopReason: status });
+        // Timing and status only (no content): visible in Vercel → Logs.
+        console.info("[api/chat] round finished", { firstTokenMs, totalMs: Date.now() - roundStart, chars, status, sawCompleted, events: seen });
+        return { status, sawCompleted };
+      };
+
+      try {
+        const result = await orchestrate({
+          baseSteps: steps,
+          token,
+          signal: req.signal,
+          runRound,
+          send,
+          describeError: (err) => {
+            // Status and type only; never the key or request body.
+            const st = typeof (err as { status?: unknown })?.status === "number" ? (err as { status: number }).status : "n/a";
+            console.error("[api/chat] upstream error", { status: st, name: err instanceof Error ? err.name : typeof err });
+            return { message: toSafeError(err).message, transient: isTransientError(err) };
+          },
+        });
+        console.info("[api/chat] finished", { outcome: result.outcome, rounds: result.rounds, chars: result.produced.length, totalMs: Date.now() - startedAt });
       } catch (err) {
         if (!req.signal.aborted) {
-          // Visible in Vercel → Logs. Status and type only; never the key or request body.
-          const status = typeof (err as { status?: unknown })?.status === "number" ? (err as { status: number }).status : "n/a";
-          console.error("[api/chat] upstream error", { status, name: err instanceof Error ? err.name : typeof err });
+          console.error("[api/chat] unexpected error", { name: err instanceof Error ? err.name : typeof err });
           send({ type: "error", message: toSafeError(err).message });
         }
       } finally {
