@@ -2,8 +2,9 @@
 
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { CheckIcon, CopyIcon, DownloadIcon } from "@/components/ui/icons";
-import { PreviewModal } from "./PreviewModal";
-import { downloadText, extensionFor } from "@/lib/chat/code-export";
+import { FilePanel } from "./FilePanel";
+import { copyText, downloadFile } from "@/lib/chat/code-export";
+import { extensionFor, makeFile } from "@/lib/chat/file-protocol";
 
 interface CodeBlockProps {
   language: string;
@@ -20,25 +21,16 @@ export function CodeBlock({ language, text, filename, children }: CodeBlockProps
     if (timer.current) clearTimeout(timer.current);
   }, []);
 
+  const [failed, setFailed] = useState(false);
   const copy = useCallback(async () => {
-    try {
-      await navigator.clipboard.writeText(text);
-    } catch {
-      const ta = document.createElement("textarea");
-      ta.value = text;
-      ta.style.position = "fixed";
-      ta.style.opacity = "0";
-      document.body.appendChild(ta);
-      ta.select();
-      try {
-        document.execCommand("copy");
-      } finally {
-        document.body.removeChild(ta);
-      }
-    }
-    setCopied(true);
+    const ok = await copyText(text);
+    setCopied(ok);
+    setFailed(!ok);
     if (timer.current) clearTimeout(timer.current);
-    timer.current = setTimeout(() => setCopied(false), 1800);
+    timer.current = setTimeout(() => {
+      setCopied(false);
+      setFailed(false);
+    }, 1800);
   }, [text]);
 
   const [preview, setPreview] = useState(false);
@@ -61,7 +53,7 @@ export function CodeBlock({ language, text, filename, children }: CodeBlockProps
         )}
         <button
           type="button"
-          onClick={() => downloadText(saveName, text)}
+          onClick={() => downloadFile(saveName, text)}
           aria-label={`Download ${saveName}`}
           className="flex items-center gap-1.5 rounded-md px-2 py-1 text-xs text-muted transition hover:bg-raised hover:text-fg active:scale-95"
         >
@@ -71,7 +63,7 @@ export function CodeBlock({ language, text, filename, children }: CodeBlockProps
         <button
           type="button"
           onClick={copy}
-          aria-label={copied ? "Copied" : "Copy code"}
+          aria-label={copied ? "Copied" : failed ? "Copy failed" : "Copy code"}
           className="flex items-center gap-1.5 rounded-md px-2 py-1 text-xs text-muted transition hover:bg-raised hover:text-fg active:scale-95"
         >
           <span className="relative block h-[14px] w-[14px]">
@@ -86,12 +78,18 @@ export function CodeBlock({ language, text, filename, children }: CodeBlockProps
               className={`absolute inset-0 text-cyan transition duration-200 ${copied ? "scale-100 opacity-100" : "scale-50 opacity-0"}`}
             />
           </span>
-          <span aria-live="polite">{copied ? "Copied" : "Copy"}</span>
+          <span aria-live="polite" className={failed ? "text-red-400" : undefined}>{copied ? "Copied" : failed ? "Copy failed" : "Copy"}</span>
         </button>
         </div>
       </div>
       {children}
-      {preview && <PreviewModal files={[{ name: saveName.endsWith(".html") ? saveName : "index.html", content: text }]} onClose={() => setPreview(false)} />}
+      {preview && (
+        <FilePanel
+          files={[makeFile(saveName.endsWith(".html") ? saveName : "index.html", "html", text)]}
+          initialPath={saveName.endsWith(".html") ? saveName : "index.html"}
+          onClose={() => setPreview(false)}
+        />
+      )}
     </div>
   );
 }

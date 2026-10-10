@@ -1,9 +1,11 @@
 "use client";
 
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { Attachment, Message } from "@/types";
 import { ArrowDownIcon } from "@/components/ui/icons";
 import { MessageItem } from "./MessageItem";
+import { analyzeConversation } from "@/lib/chat/project";
+import { detectIntent } from "@/lib/chat/intent";
 
 interface MessageListProps {
   conversationId: string;
@@ -11,12 +13,11 @@ interface MessageListProps {
   streamingId: string | null;
   getLive: (messageId: string) => Attachment[] | undefined;
   onRegenerate: () => void;
-  onContinue: () => void;
 }
 
 const THRESHOLD = 80;
 
-export function MessageList({ conversationId, messages, streamingId, getLive, onRegenerate, onContinue }: MessageListProps) {
+export function MessageList({ conversationId, messages, streamingId, getLive, onRegenerate }: MessageListProps) {
   const scroller = useRef<HTMLDivElement>(null);
   const pinned = useRef(true);
   const [atBottom, setAtBottom] = useState(true);
@@ -71,22 +72,38 @@ export function MessageList({ conversationId, messages, streamingId, getLive, on
 
   const streaming = streamingId !== null;
 
+  // Files per assistant message, classified against what the project already contained (attachments + earlier files).
+  const analysis = useMemo(
+    () =>
+      analyzeConversation(messages, streamingId, (id) => {
+        const live = getLive(id);
+        return live?.map((a) => ({ name: a.name, text: a.text }));
+      }),
+    [messages, streamingId, getLive],
+  );
+
   return (
     <div className="relative min-h-0 flex-1">
       <div ref={scroller} onScroll={onScroll} className="scroll-thin h-full overflow-y-auto overscroll-contain" role="log" aria-live="off" aria-label="Conversation">
         <div className="mx-auto flex w-full max-w-3xl flex-col gap-8 px-4 pb-10 pt-8 sm:px-6">
-          {messages.map((m, i) => (
-            <MessageItem
-              key={m.id}
-              message={m}
-              streaming={m.id === streamingId}
-              isLast={i === messages.length - 1}
-              disabled={streaming}
-              getLive={getLive}
-              onRegenerate={onRegenerate}
-              onContinue={onContinue}
-            />
-          ))}
+          {messages.map((m, i) => {
+            // The request an assistant answer belongs to decides which download is emphasised.
+            const asked = m.role === "assistant" ? detectIntent(messages[i - 1]?.role === "user" ? messages[i - 1].content : "") : { zip: false, changedOnly: false };
+            return (
+              <MessageItem
+                key={m.id}
+                message={m}
+                streaming={m.id === streamingId}
+                isLast={i === messages.length - 1}
+                disabled={streaming}
+                getLive={getLive}
+                onRegenerate={onRegenerate}
+                analysis={analysis.get(m.id)}
+                wantsZip={asked.zip}
+                changedOnly={asked.changedOnly}
+              />
+            );
+          })}
         </div>
       </div>
 

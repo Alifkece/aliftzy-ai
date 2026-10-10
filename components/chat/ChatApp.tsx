@@ -112,7 +112,6 @@ export function ChatApp() {
               streamingId={chat.streamingId}
               getLive={chat.getLive}
               onRegenerate={chat.regenerate}
-              onContinue={chat.continueGeneration}
             />
           ) : (
             <div className="scroll-thin min-h-0 flex-1 overflow-y-auto">
